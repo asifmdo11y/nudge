@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-nudge - a daily digest of your GitHub notifications
+nudge - GitHub notification digest with AI triage
+
+fetches your GitHub notifications and uses Claude to prioritize them:
+what actually needs a response today, what can wait, and what you can ignore.
 """
 
 import os
@@ -10,18 +13,52 @@ import argparse
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
-from collections import defaultdict
-from pathlib import Path
+
+import anthropic
 
 
-CACHE_FILE = Path.home() / ".nudge_cache.json"
+TRIAGE_PROMPT = """You are a software engineer helping triage GitHub notifications.
+
+Here are the current GitHub notifications for this developer:
+
+{notifications}
+
+Triage these into three buckets:
+
+1. **Needs response today** — you're blocked, someone is waiting, review requested, direct mention
+2. **Worth reading** — relevant but not urgent, can wait until tomorrow
+3. **Can skip** — subscribed by default, automated noise, already resolved context
+
+For each notification, give:
+- Which bucket it belongs to
+- One-line reason
+
+Then write a brief summary at the top: what's the most important thing to deal with right now?
+
+Be direct. Engineers are busy. Don't over-explain.
+
+Return a JSON object:
+{{
+  "headline": "1-2 sentence summary of what actually needs attention",
+  "today": [
+    {{ "repo": "...", "title": "...", "type": "PR/Issue/etc", "reason": "why now" }}
+  ],
+  "later": [
+    {{ "repo": "...", "title": "...", "type": "...", "reason": "..." }}
+  ],
+  "skip": [
+    {{ "repo": "...", "title": "...", "type": "...", "reason": "..." }}
+  ]
+}}
+
+Return only valid JSON.
+"""
+
 
 REASON_LABELS = {
     "assign": "assigned to you",
     "author": "you opened this",
     "comment": "you commented",
-    "invitation": "invitation",
-    "manual": "you subscribed",
     "mention": "mentioned you",
     "review_requested": "review requested",
     "security_alert": "security alert",
@@ -31,21 +68,19 @@ REASON_LABELS = {
     "ci_activity": "CI activity",
 }
 
-# notification types that usually need action from you
-NEEDS_ACTION = {"mention", "review_requested", "assign", "security_alert", "invitation"}
-
 
 def get_token():
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if not token:
-        # try reading from gh cli config — this is what gh stores it as
-        config_path = Path.home() / ".config" / "gh" / "hosts.yml"
-        if config_path.exists():
+        # try gh CLI config
+        from pathlib import Path
+        config = Path.home() / ".config" / "gh" / "hosts.yml"
+        if config.exists():
             try:
-                import yaml  # type: ignore
-                with open(config_path) as f:
-                    config = yaml.safe_load(f)
-                token = config.get("github.com", {}).get("oauth_token")
+                import yaml
+                with open(config) as f:
+                    data = yaml.safe_load(f)
+                token = data.get("github.com", {}).get("oauth_token")
             except Exception:
                 pass
 
@@ -57,11 +92,10 @@ def get_token():
     return token
 
 
-def gh_request(path, token, params=None):
+def gh_get(path, token, params=None):
     url = f"https://api.github.com{path}"
     if params:
-        query = "&".join(f"{k}={v}" for k, v in params.items())
-        url = f"{url}?{query}"
+        url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
 
     req = urllib.request.Request(url)
     req.add_header("Authorization", f"Bearer {token}")
@@ -70,165 +104,155 @@ def gh_request(path, token, params=None):
 
     try:
         with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read().decode())
+            return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         if e.code == 401:
-            print("[nudge] authentication failed — check your token")
+            print("[nudge] auth failed — check your GitHub token")
             sys.exit(1)
         raise
 
 
-def fetch_notifications(token, since=None, include_read=False):
-    params = {"per_page": "100", "all": str(include_read).lower()}
-    if since:
-        params["since"] = since.isoformat()
-    return gh_request("/notifications", token, params)
+def fetch_notifications(token, since_hours=24, include_read=False):
+    since = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+    params = {
+        "per_page": "50",
+        "all": str(include_read).lower(),
+        "since": since.isoformat(),
+    }
+    return gh_get("/notifications", token, params)
 
 
-def group_by_repo(notifications):
-    groups = defaultdict(list)
+def flatten_for_llm(notifications: list) -> list[dict]:
+    """Reduce notification objects to what Claude actually needs."""
+    items = []
     for n in notifications:
-        repo = n["repository"]["full_name"]
-        groups[repo].append(n)
-    return dict(groups)
+        items.append({
+            "repo": n["repository"]["full_name"],
+            "title": n["subject"]["title"],
+            "type": n["subject"]["type"],
+            "reason": REASON_LABELS.get(n.get("reason", ""), n.get("reason", "")),
+            "unread": n.get("unread", False),
+            "updated": n.get("updated_at", ""),
+        })
+    return items
 
 
-def parse_time(s):
-    if s is None:
-        return None
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+def triage_with_claude(client: anthropic.Anthropic, notifications: list) -> dict:
+    flat = flatten_for_llm(notifications)
+
+    message = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1500,
+        messages=[{
+            "role": "user",
+            "content": TRIAGE_PROMPT.format(notifications=json.dumps(flat, indent=2))
+        }]
+    )
+
+    raw = message.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"headline": raw, "today": [], "later": [], "skip": []}
 
 
-def format_age(dt):
-    if dt is None:
-        return "?"
-    now = datetime.now(timezone.utc)
-    delta = now - dt
-    hours = int(delta.total_seconds() / 3600)
-    if hours < 1:
-        return "just now"
-    if hours < 24:
-        return f"{hours}h ago"
-    days = hours // 24
-    if days < 7:
-        return f"{days}d ago"
-    return f"{days // 7}w ago"
+def print_triage(triage: dict, total: int):
+    headline = triage.get("headline", "")
+    if headline:
+        print(f"\n  {headline}\n")
+
+    today = triage.get("today", [])
+    later = triage.get("later", [])
+    skip = triage.get("skip", [])
+
+    if today:
+        print(f"  Needs response today ({len(today)})")
+        print()
+        for item in today:
+            print(f"    [{item.get('type', '?')[:2].upper()}] {item['repo']}  —  {item['title'][:60]}")
+            print(f"         {item.get('reason', '')}")
+        print()
+
+    if later:
+        print(f"  Worth reading ({len(later)})")
+        for item in later:
+            print(f"    [{item.get('type', '?')[:2].upper()}] {item['repo']}  —  {item['title'][:60]}")
+        print()
+
+    if skip:
+        print(f"  Can skip ({len(skip)}) — {', '.join(set(i['repo'].split('/')[1] for i in skip[:5]))}, ...")
+        print()
 
 
-def print_digest(groups, only_actionable=False):
-    total = sum(len(v) for v in groups.values())
-    if total == 0:
+def print_raw(notifications: list):
+    """Fallback table view without AI."""
+    if not notifications:
         print("\n  you're all caught up.")
         return
 
-    action_count = sum(
-        1 for ns in groups.values()
-        for n in ns
-        if n.get("reason") in NEEDS_ACTION
-    )
+    from collections import defaultdict
+    by_repo = defaultdict(list)
+    for n in notifications:
+        by_repo[n["repository"]["full_name"]].append(n)
 
-    print(f"\n  {total} notification(s) across {len(groups)} repo(s)", end="")
-    if action_count:
-        print(f"  |  {action_count} need your attention")
-    else:
-        print()
-    print()
+    print(f"\n  {len(notifications)} notification(s) across {len(by_repo)} repo(s)\n")
 
-    for repo, notifications in sorted(groups.items()):
-        # filter if needed
-        if only_actionable:
-            notifications = [n for n in notifications if n.get("reason") in NEEDS_ACTION]
-            if not notifications:
-                continue
-
+    for repo, items in sorted(by_repo.items()):
         print(f"  {repo}")
-
-        for n in notifications:
-            title = n["subject"]["title"]
-            ntype = n["subject"]["type"]  # PullRequest, Issue, etc.
-            reason = n.get("reason", "")
-            reason_label = REASON_LABELS.get(reason, reason)
-            updated = parse_time(n.get("updated_at"))
-            age = format_age(updated)
+        for n in items:
+            title = n["subject"]["title"][:55]
+            reason = REASON_LABELS.get(n.get("reason", ""), "")
             unread = "•" if n.get("unread") else " "
-            needs = "!" if reason in NEEDS_ACTION else " "
-
-            # truncate long titles
-            if len(title) > 55:
-                title = title[:52] + "..."
-
-            type_abbr = {"PullRequest": "PR", "Issue": "IS", "Release": "RL", "Commit": "CM"}.get(ntype, ntype[:2])
-            print(f"    {unread}{needs} [{type_abbr}] {title:<55}  {reason_label:<20}  {age}")
-
+            ntype = n["subject"]["type"][:2]
+            print(f"    {unread} [{ntype}] {title:<55}  {reason}")
         print()
-
-
-def load_cache():
-    if CACHE_FILE.exists():
-        try:
-            with open(CACHE_FILE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-
-def save_cache(data):
-    with open(CACHE_FILE, "w") as f:
-        json.dump(data, f)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="nudge - GitHub notification digest"
+        description="nudge - GitHub notification digest with AI triage"
     )
-    parser.add_argument(
-        "--since",
-        type=int,
-        default=24,
-        metavar="HOURS",
-        help="show notifications from the last N hours (default: 24)"
-    )
-    parser.add_argument(
-        "--all",
-        action="store_true",
-        help="include already-read notifications"
-    )
-    parser.add_argument(
-        "--actionable",
-        action="store_true",
-        help="only show notifications that need your action"
-    )
-    parser.add_argument(
-        "--mark-read",
-        action="store_true",
-        help="mark all shown notifications as read (not implemented yet)"
-    )
+    parser.add_argument("--since", type=int, default=24, metavar="HOURS",
+                        help="look back N hours (default: 24)")
+    parser.add_argument("--all", action="store_true",
+                        help="include already-read notifications")
+    parser.add_argument("--no-ai", action="store_true",
+                        help="show raw notification list without triage")
     args = parser.parse_args()
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key and not args.no_ai:
+        print("[nudge] ANTHROPIC_API_KEY not set — use --no-ai for raw list")
+        sys.exit(1)
 
     token = get_token()
 
-    since_dt = None
-    if args.since:
-        since_dt = datetime.now(timezone.utc) - timedelta(hours=args.since)
-
-    print(f"[nudge] fetching notifications", end="")
-    if since_dt:
-        print(f" from the last {args.since}h...", end="")
-    print()
-
-    notifications = fetch_notifications(token, since=since_dt, include_read=args.all)
+    print(f"[nudge] fetching notifications from the last {args.since}h...", flush=True)
+    notifications = fetch_notifications(token, since_hours=args.since, include_read=args.all)
 
     if not isinstance(notifications, list):
         print(f"[nudge] unexpected response: {notifications}")
         sys.exit(1)
 
-    groups = group_by_repo(notifications)
-    print_digest(groups, only_actionable=args.actionable)
+    if not notifications:
+        print("[nudge] no notifications — you're all caught up.")
+        sys.exit(0)
 
-    if args.mark_read:
-        # TODO: implement mark-as-read via PATCH /notifications
-        print("[nudge] --mark-read not implemented yet")
+    print(f"[nudge] {len(notifications)} notification(s) found")
+
+    if args.no_ai:
+        print_raw(notifications)
+        return
+
+    print("[nudge] triaging with Claude...\n")
+    client = anthropic.Anthropic(api_key=api_key)
+    triage = triage_with_claude(client, notifications)
+    print_triage(triage, total=len(notifications))
 
 
 if __name__ == "__main__":

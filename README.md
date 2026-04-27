@@ -1,63 +1,78 @@
 # nudge
 
-A no-nonsense GitHub notification digest. Instead of opening the GitHub notifications tab and losing 20 minutes, run this and see exactly what needs your attention.
+GitHub notification digest with AI triage.
+
+Fetches your notifications and uses Claude to sort them into three buckets: what needs a response today, what's worth reading later, and what you can skip. No more opening 40 notifications to find the 3 that actually matter.
 
 ```
 $ python nudge.py
 
 [nudge] fetching notifications from the last 24h...
+[nudge] 31 notification(s) found
+[nudge] triaging with Claude...
 
-  14 notification(s) across 5 repo(s)  |  3 need your attention
+  You have a review request on the auth refactor that's blocking a deploy,
+  and a direct mention on a prod incident thread that needs your input.
 
-  myorg/api-service
-    •! [PR] fix: handle null user in token refresh                    review requested      2h ago
-    •  [IS] Add rate limiting to public endpoints                      you commented         5h ago
-       [PR] chore: bump dependencies                                   watching              1d ago
+  Needs response today (3)
 
-  myorg/frontend
-    •! [PR] feat: new dashboard layout                                 review requested      3h ago
-       [IS] Safari CSS bug on login page                               mentioned you         6h ago
+    [PR] myorg/api-service  —  feat: refactor token auth middleware
+         review requested
+    [IS] myorg/infra         —  prod: elevated 5xx rate on payment service
+         mentioned you
+    [PR] myorg/frontend      —  fix: CORS headers missing on /api/v2
+         assigned to you
 
-  ...
-```
+  Worth reading (8)
+    [PR] myorg/api-service  —  chore: bump dependencies to latest
+    [IS] myorg/docs          —  Update OAuth2 integration guide
+    [PR] myorg/frontend      —  feat: dark mode toggle in settings
+    ...
 
-Notifications marked with `!` need something from you (review, mention, assignment, etc).
-
-## usage
-
-```bash
-python nudge.py                     # last 24 hours (unread only)
-python nudge.py --since 48          # last 48 hours
-python nudge.py --all               # include already-read notifications
-python nudge.py --actionable        # only show ones that need action
+  Can skip (20) — workflows, api-service, infra, frontend, ...
 ```
 
 ## setup
 
-You need a GitHub token with `notifications` scope.
+```bash
+git clone https://github.com/asifmdo11y/nudge
+cd nudge
+pip install -r requirements.txt
+export ANTHROPIC_API_KEY=sk-ant-...
+export GITHUB_TOKEN=ghp_...       # or: already logged in via gh CLI
+python nudge.py
+```
 
-**Option 1**: if you have `gh` CLI installed and logged in, it works automatically.
+## usage
+
+```bash
+python nudge.py                  # last 24h, unread only, with AI triage
+python nudge.py --since 48       # last 48 hours
+python nudge.py --all            # include already-read
+python nudge.py --no-ai          # raw list without Claude triage
+```
+
+## how it works
+
+1. fetches notifications from the GitHub API (last N hours)
+2. strips each notification down to: repo, title, type, reason, read status
+3. sends the full list to Claude and asks it to triage into today / later / skip
+4. Claude uses the notification reason (review_requested, mention, assign, etc.) plus title context to decide urgency
+5. prints the triage in order of priority
+
+## GitHub token
+
+You need a token with `notifications` scope.
+
+**Option 1**: already using `gh` CLI? nudge reads its token automatically.
 
 **Option 2**: set `GITHUB_TOKEN` in your environment:
-
 ```bash
 export GITHUB_TOKEN=ghp_your_token_here
 ```
 
-Then:
+## requirements
 
-```bash
-git clone https://github.com/asifmdo11y/nudge
-cd nudge
-python nudge.py
-```
-
-No dependencies beyond Python stdlib. (The `yaml` import is optional and only used if you have the gh CLI config — it falls back gracefully.)
-
-## why
-
-GitHub's notification UI is fine but I wanted something I could pipe into a script, run from cron, or just glance at in the terminal without context-switching to the browser. This does that.
-
----
-
-authored by asif
+- Python 3.10+
+- `ANTHROPIC_API_KEY` environment variable
+- `GITHUB_TOKEN` or `GH_TOKEN` (or `gh` CLI logged in)
